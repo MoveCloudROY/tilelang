@@ -99,6 +99,7 @@ struct AllReduce {
   template <typename T> static __device__ T run(T x, T *red_buf = nullptr) {
     constexpr int offset = threads / 2;
     constexpr int warpSize = 64;
+    constexpr int logicalWidth = threads <= 32 ? 32 : warpSize;
 
     if constexpr (offset >= warpSize) {
       __syncthreads();
@@ -106,7 +107,7 @@ struct AllReduce {
       __syncthreads();
       x = Reducer()(x, red_buf[threadIdx.x ^ offset]);
     } else {
-      x = Reducer()(x, tl::shfl_xor(x, offset));
+      x = Reducer()(x, tl::dpp_shfl_xor_32(x, offset, logicalWidth));
     }
     if constexpr (offset == scale) {
       return x;
@@ -121,6 +122,7 @@ struct AllReduce {
   static __device__ void run_batch(T *x, T *red_buf = nullptr) {
     constexpr int offset = threads / 2;
     constexpr int warpSize = 64;
+    constexpr int logicalWidth = threads <= 32 ? 32 : warpSize;
 
     if constexpr (offset >= warpSize) {
       __syncthreads();
@@ -136,7 +138,7 @@ struct AllReduce {
     } else {
 #pragma unroll
       for (int i = 0; i < batch_size; i++)
-        x[i] = Reducer()(x[i], tl::shfl_xor(x[i], offset));
+        x[i] = Reducer()(x[i], tl::dpp_shfl_xor_32(x[i], offset, logicalWidth));
     }
     if constexpr (offset == scale) {
       return;
@@ -317,11 +319,11 @@ TL_DEVICE T warp_reduce(T value, ReduceOp op) {
   // backward compatibility.  Full wave64 utilisation (6-step, width=64) would
   // require restructuring inter-warp shared-memory communication in all
   // kernels and is deferred to a separate optimisation pass.
-  value = op(value, __shfl_xor(value, 16, 32));
-  value = op(value, __shfl_xor(value, 8, 32));
-  value = op(value, __shfl_xor(value, 4, 32));
-  value = op(value, __shfl_xor(value, 2, 32));
-  value = op(value, __shfl_xor(value, 1, 32));
+  value = op(value, tl::dpp_shfl_xor_32(value, 16, 32));
+  value = op(value, tl::dpp_shfl_xor_32(value, 8, 32));
+  value = op(value, tl::dpp_shfl_xor_32(value, 4, 32));
+  value = op(value, tl::dpp_shfl_xor_32(value, 2, 32));
+  value = op(value, tl::dpp_shfl_xor_32(value, 1, 32));
   return value;
 }
 

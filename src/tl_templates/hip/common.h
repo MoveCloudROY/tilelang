@@ -267,6 +267,56 @@ template <typename T> TL_DEVICE T shfl_xor(T val, int delta) {
   return __shfl_xor(val, delta);
 }
 
+template <int LaneMask> TL_DEVICE int dpp_shfl_xor_i32(int val) {
+  static_assert(LaneMask >= 1 && LaneMask < 16,
+                "DPP row xmask only supports lane masks in [1, 15]");
+  constexpr int kRowXMask0 = 0x160;
+  return __builtin_amdgcn_update_dpp(val, val, kRowXMask0 + LaneMask, 0xf,
+                                     0xf, false);
+}
+
+template <typename T> TL_DEVICE T dpp_shfl_xor_32(T val, int delta, int width) {
+  (void)width;
+  return tl::shfl_xor(val, delta);
+}
+
+template <> TL_DEVICE int dpp_shfl_xor_32(int val, int delta, int width) {
+  if (width == 32) {
+    switch (delta) {
+    case 1:
+      return dpp_shfl_xor_i32<1>(val);
+    case 2:
+      return dpp_shfl_xor_i32<2>(val);
+    case 4:
+      return dpp_shfl_xor_i32<4>(val);
+    case 8:
+      return dpp_shfl_xor_i32<8>(val);
+    default:
+      break;
+    }
+  }
+  return __shfl_xor(val, delta, width);
+}
+
+template <>
+TL_DEVICE unsigned dpp_shfl_xor_32(unsigned val, int delta, int width) {
+  int bits;
+  __builtin_memcpy(&bits, &val, sizeof(bits));
+  bits = dpp_shfl_xor_32(bits, delta, width);
+  unsigned out;
+  __builtin_memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+template <> TL_DEVICE float dpp_shfl_xor_32(float val, int delta, int width) {
+  int bits;
+  __builtin_memcpy(&bits, &val, sizeof(bits));
+  bits = dpp_shfl_xor_32(bits, delta, width);
+  float out;
+  __builtin_memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
 template <typename T> TL_DEVICE T shfl_down(T val, int delta) {
   return __shfl_down(val, delta);
 }
