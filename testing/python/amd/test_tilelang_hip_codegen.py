@@ -158,6 +158,35 @@ def test_warp_reduce_with_64_threads_two_groups():
     assert not out.isnan().any(), "NaN in two-warp reduce — width=32 fix not applied"
 
 
+@tilelang.testing.requires_rocm
+def test_dpp_warp_reduce_sum_float32_correctness():
+    """
+    32-thread float32 warp_reduce_sum exercises the DPP-backed 32-bit helper
+    while preserving the same all-lane result as the previous shuffle path.
+    """
+    N = 32
+
+    @tilelang.jit
+    def warp_reduce_kernel():
+        @T.prim_func
+        def kernel(
+            x: T.Tensor((N,), T.float32),
+        ) -> None:
+            with T.Kernel(1, threads=N):
+                tx = T.get_thread_binding()
+                local = T.alloc_local((1,), T.float32)
+                local[0] = x[tx]
+                x[tx] = T.warp_reduce_sum(local[0])
+
+        return kernel
+
+    x = torch.arange(1, N + 1, dtype=torch.float32, device="cuda")
+    expected = torch.full_like(x, x.sum())
+    warp_reduce_kernel()(x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(x, expected, atol=1e-4, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # Fix 2 — src/target/codegen_hip.cc (VisitExpr_ ShuffleNode)
 #         src/tl_templates/hip/common.h (uint1 bfloat16x2 math overloads)
