@@ -186,6 +186,11 @@ def CUDAPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.StorageRewrite()(mod)
     mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tilelang.transform.UnrollLoop()(mod)
+    # Experimental register-locality scheduling for unrolled path regions.
+    # Runs after UnrollLoop so scalarized path statements are visible, and
+    # before Simplify/RemoveNoOp which clean up the rewritten regions.
+    if pass_ctx.config.get("tl.enable_path_locality_reorder", False):
+        mod = tilelang.transform.PathLocalityReorder()(mod)
     mod = s_tir.transform.RenormalizeSplitPattern()(mod)
     mod = tirx.transform.Simplify()(mod)
     mod = tirx.transform.RemoveNoOp()(mod)

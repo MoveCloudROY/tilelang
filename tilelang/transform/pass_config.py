@@ -161,6 +161,51 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_LOOP_UNSWITCHING = "tl.disable_loop_unswitching"
     """Disable loop unswitching optimization. Default: False"""
 
+    TL_ENABLE_PATH_LOCALITY_REORDER = "tl.enable_path_locality_reorder"
+    """Enable the PathLocalityReorder pass in the CUDA pipeline. Default: False
+
+    When True, unrolled "path" statement regions (e.g.
+    ``out[v] += coeff * w[i] * x[j] * y[k]``) are list-scheduled under a
+    virtual register budget so repeated operand loads are shared. The pass is
+    experimental and therefore disabled by default.
+    """
+
+    TL_PATH_LOCALITY_REORDER = "tl.PathLocalityReorder"
+    """Configuration for the PathLocalityReorder pass.
+
+    This is a dict-based config with the following options:
+    - enable: bool, default True. Whether the pass rewrites anything when
+      invoked. Rollout gating happens via `tl.enable_path_locality_reorder`;
+      this key is an escape hatch to hard-disable an explicitly wired pass.
+    - max_paths: int, default 64. Maximum number of path statements per
+      region; larger regions are left untouched.
+    - reg_budget: int, default 16. Virtual register budget for live operand
+      labels and pair temporaries (a scheduling budget, not the ptxas
+      register count).
+    - enable_pair_cse: bool, default True. Materialize repeated pair products
+      (e.g. ``w[i] * x[j]``) as scalar temporaries when the pair has at least
+      two remaining uses and a virtual register is free. Paths consuming a
+      cached pair have their multiplication chain reassociated, which can
+      change bit-level rounding; disable for bit-exact scheduling.
+    - enable_secondary_affinity: bool, default True. Include second-order
+      affinity with neighbor labels in the label selection score.
+    - min_shared_reads: int, default 1. Minimum number of avoided reloads
+      (sum over labels of uses-1) required before a region is rewritten.
+    - path_fallback_after: int, default 0. Force path-directed label
+      selection after this many scheduler iterations without progress;
+      non-positive values mean max(8, 2 * reg_budget).
+    - allow_atomic_reorder: bool, default False. Allow reordering two updates
+      to the same output element (relaxes floating-point addition
+      association).
+
+    Usage:
+        with tilelang.transform.PassContext(config={
+            "tl.enable_path_locality_reorder": True,
+            "tl.PathLocalityReorder": {"reg_budget": 16},
+        }):
+            kernel = tilelang.compile(fn, target="cuda")
+    """
+
     TL_LOOP_UNSWITCHING_ALLOW_NON_TRIVIAL_ELSE = "tl.loop_unswitching_allow_non_trivial_else"
     """Allow loop unswitching even when the else-version of the loop body has side effects.
 

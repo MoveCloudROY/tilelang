@@ -395,3 +395,34 @@ def UnrollLoop():
         The result pass
     """
     return _ffi_api.UnrollLoop()  # type: ignore
+
+
+def PathLocalityReorder():
+    """Reorder unrolled "path" statements for register locality.
+
+    Groups structurally-equivalent path statements (e.g. the unrolled body of
+    ``out[v] += coeff * w[i] * x[j] * y[k]``) into regions, converts repeated
+    operand loads into named scalar bindings, and list-schedules the path
+    computations under a virtual register budget so shared operands are loaded
+    once. Optionally materializes repeated pair products (pair CSE).
+
+    Configured through the ``tl.PathLocalityReorder`` pass config:
+    - enable: whether the pass rewrites anything when invoked (default True)
+    - max_paths: maximum region size (default 64)
+    - reg_budget: virtual register budget (default 16)
+    - enable_pair_cse: materialize repeated pair products (default True)
+    - enable_secondary_affinity: second-order label affinity (default True)
+    - min_shared_reads: minimum avoided reloads to rewrite (default 1)
+    - path_fallback_after: no-progress threshold, 0 = 2*reg_budget (default 0)
+    - allow_atomic_reorder: allow reordering updates to the same output
+      element, relaxing float addition association (default False)
+
+    In the CUDA pipeline the pass only runs when the
+    ``tl.enable_path_locality_reorder`` pass config is set to True.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.PathLocalityReorder()  # type: ignore
