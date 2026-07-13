@@ -1136,6 +1136,65 @@ const VarNode *OutputDataVar(const LabelInfo &info) {
 }
 
 /*!
+ * \brief An analyzer-simplified index split into a symbolic part and a
+ * constant offset.
+ *
+ * Output offsets of scatter kernels are typically `sym + const` where `sym`
+ * contains runtime indirection loads (e.g. dst_idx[e] * stride + lane). The
+ * analyzer cannot cancel opaque loads across two expressions, but within a
+ * validated region no statement writes the buffers those loads read, so
+ * structurally equal symbolic parts are value-equal and disjointness reduces
+ * to comparing the constant offsets.
+ */
+struct IndexParts {
+  PrimExpr sym;
+  int64_t offset{0};
+};
+
+IndexParts DecomposeIndex(const PrimExpr &index) {
+  IndexParts parts;
+  parts.sym = index;
+  if (const auto *add = parts.sym.as<AddNode>()) {
+    if (const auto *imm = add->b.as<IntImmNode>()) {
+      parts.offset = imm->value;
+      parts.sym = add->a;
+    }
+  }
+  if (const auto *imm = parts.sym.as<IntImmNode>()) {
+    parts.offset += imm->value;
+    parts.sym = PrimExpr();
+  }
+  return parts;
+}
+
+/*! \brief Per-dimension equal/distinct decision for two output indices. */
+void CompareIndexDim(const PrimExpr &a, const PrimExpr &b,
+                     arith::Analyzer *analyzer, bool *dim_equal,
+                     bool *dim_distinct) {
+  IndexParts pa = DecomposeIndex(a);
+  IndexParts pb = DecomposeIndex(b);
+  bool sym_equal = (!pa.sym.defined() && !pb.sym.defined()) ||
+                   (pa.sym.defined() && pb.sym.defined() &&
+                    StructuralEqual()(pa.sym, pb.sym));
+  if (sym_equal) {
+    *dim_equal = pa.offset == pb.offset;
+    *dim_distinct = pa.offset != pb.offset;
+    return;
+  }
+  // Heterogeneous symbolic parts: fall back to the analyzer. Simplifying the
+  // difference lets the canonical simplifier cancel common opaque subterms
+  // that CanProve alone would not.
+  PrimExpr diff = analyzer->Simplify(a - b);
+  if (const auto *imm = diff.as<IntImmNode>()) {
+    *dim_equal = imm->value == 0;
+    *dim_distinct = imm->value != 0;
+    return;
+  }
+  *dim_equal = analyzer->CanProveEqual(a, b);
+  *dim_distinct = analyzer->CanProve(a != b);
+}
+
+/*!
  * \brief Validate a candidate region. Rejection keeps the original order, so
  * every check may be conservative.
  */
@@ -1184,10 +1243,14 @@ bool ValidateRegion(const Region &region,
       bool provably_equal = true;
       bool provably_distinct = false;
       for (size_t d = 0; d < la.indices.size(); ++d) {
-        if (!analyzer->CanProveEqual(la.indices[d], lb.indices[d])) {
+        bool dim_equal = false;
+        bool dim_distinct = false;
+        CompareIndexDim(la.indices[d], lb.indices[d], analyzer, &dim_equal,
+                        &dim_distinct);
+        if (!dim_equal) {
           provably_equal = false;
         }
-        if (analyzer->CanProve(la.indices[d] != lb.indices[d])) {
+        if (dim_distinct) {
           provably_distinct = true;
         }
       }
