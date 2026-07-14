@@ -40,6 +40,10 @@
  * output, and all outputs are provably pairwise-disjoint (or duplicates are
  * explicitly allowed via `allow_atomic_reorder`). Any statement that does not
  * match the pattern (barriers, calls, control flow, ...) fences the region.
+ * Under `allow_atomic_reorder` (+ `enable_output_accumulation`), repeated
+ * updates to one output element accumulate in a scalar register chain and
+ * store/atomically add once — the FastEq resident-accumulator policy — so a
+ * region with P paths over V output elements emits V (not P) atomics.
  * Scheduled paths reproduce the original value expression bit-exactly except
  * under pair CSE, which reassociates the multiplication chain of paths that
  * consume a cached pair; set `enable_pair_cse=false` (or fence the loop with
@@ -111,6 +115,7 @@ struct PathLocalityReorderConfigNode
   int min_shared_reads;
   int path_fallback_after;
   bool allow_atomic_reorder;
+  bool enable_output_accumulation;
 
   static void RegisterReflection() {
     namespace refl = reflection;
@@ -160,7 +165,15 @@ struct PathLocalityReorderConfigNode
                 "Allow reordering two updates to the same output element. "
                 "This relaxes floating-point addition association and is "
                 "disabled by default.",
-                refl::DefaultValue(false));
+                refl::DefaultValue(false))
+        .def_ro("enable_output_accumulation",
+                &PathLocalityReorderConfigNode::enable_output_accumulation,
+                "Accumulate all contributions to one output element in a "
+                "scalar register chain and emit a single final store/atomic "
+                "per element. Only takes effect together with "
+                "allow_atomic_reorder, since it reassociates the additions "
+                "to that element.",
+                refl::DefaultValue(true));
   }
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.transform.PathLocalityReorderConfig",
                                     PathLocalityReorderConfigNode,
@@ -576,6 +589,12 @@ struct Region {
   LabelInterner outputs;
 };
 
+/*!
+ * \brief A null Var handle. Note Var's default constructor creates a real
+ * "v": int32 variable, so an explicit null is needed for "no register".
+ */
+Var NullVar() { return Var(ObjectPtr<VarNode>(nullptr)); }
+
 /*! \brief Replace interned input-label loads with their live scalar vars. */
 class LabelLoadReplacer : public StmtExprMutator {
 public:
@@ -621,7 +640,7 @@ public:
     label_paths_.resize(num_labels);
     remaining_uses_.assign(num_labels, 0);
     live_.assign(num_labels, false);
-    reg_of_.assign(num_labels, Var());
+    reg_of_.assign(num_labels, NullVar());
     reload_count_.assign(num_labels, 0);
 
     size_t max_path_labels = 0;
@@ -639,10 +658,27 @@ public:
       }
     }
 
-    // The budget must admit at least one full path; clamp instead of failing
-    // so misconfiguration degrades to a correct (if less shared) schedule.
-    reg_budget_ =
-        std::max({cfg->reg_budget, static_cast<int>(max_path_labels), 2});
+    // Repeated output elements accumulate in a scalar register chain and
+    // store/atomic once. This merges (and thereby reorders) the additions to
+    // one element, so it is tied to the allow_atomic_reorder policy.
+    if (cfg->allow_atomic_reorder && cfg->enable_output_accumulation) {
+      accs_.resize(region.outputs.size());
+      for (int pid = 0; pid < num_paths; ++pid) {
+        accs_[region.paths[pid].output_label].remaining += 1;
+      }
+      for (AccState &acc : accs_) {
+        if (acc.remaining < 2) {
+          acc.remaining = 0; // single contribution: keep the direct sink
+        }
+      }
+    }
+
+    // The budget must admit at least one full path (plus one accumulator
+    // slot when fusion is active); clamp instead of failing so
+    // misconfiguration degrades to a correct (if less shared) schedule.
+    int acc_slack = accs_.empty() ? 0 : 1;
+    reg_budget_ = std::max(
+        {cfg->reg_budget, static_cast<int>(max_path_labels) + acc_slack, 2});
     path_fallback_after_ = cfg->path_fallback_after > 0
                                ? cfg->path_fallback_after
                                : std::max(8, 2 * reg_budget_);
@@ -651,10 +687,13 @@ public:
   bool Schedule(Array<Stmt> *result) {
     // Termination: each fallback round loads a missing label of the target
     // path while protecting its live labels, so every path fires after at
-    // most |labels| fallback rounds. The cap is a fail-safe: on overflow the
-    // region is left untouched rather than aborting compilation.
-    int64_t max_iters = 1024 + 64 * static_cast<int64_t>(region_.paths.size()) *
-                                   std::max(1, region_.inputs.size());
+    // most |labels| fallback rounds and a sane schedule needs O(P + L)
+    // iterations. The cap is a fail-safe against thrashing schedules whose
+    // per-iteration scoring is expensive: on overflow the region is left
+    // untouched rather than spending minutes of compile time.
+    int64_t max_iters =
+        1024 + 32 * (static_cast<int64_t>(region_.paths.size()) +
+                     std::max(1, region_.inputs.size()));
     int64_t iters = 0;
     size_t done = 0;
     int no_progress = 0;
@@ -679,7 +718,7 @@ public:
 
       int label = -1;
       int victim = -1;
-      if (no_progress > path_fallback_after_ || FreeRegs() == 0) {
+      if (no_progress > path_fallback_after_ || FreeRegs() <= 0) {
         SelectByTargetPath(&label, &victim);
         no_progress = 0;
       } else {
@@ -698,8 +737,30 @@ public:
 private:
   using PairKey = std::pair<int, int>;
 
+  /*!
+   * \brief Resident accumulator for one repeated output element.
+   *
+   * Contributions chain through SSA binds (acc_1 = p0; acc_2 = acc_1 + p1;
+   * ...) and the element is stored/atomically added once when the last
+   * contribution fires. Under register pressure a live chain can be spilled
+   * early, which emits its sink now and restarts the chain — the FastEq
+   * dirty-output store_acc semantics.
+   */
+  struct AccState {
+    int remaining{0};
+    Var var = NullVar();
+    int chain_length{0};
+    /*! \brief A path of this output group, used as the sink template. */
+    int sink_pid{-1};
+  };
+
+  bool AccEligible(int output_label) const {
+    return !accs_.empty() && accs_[output_label].remaining > 0;
+  }
+
   int FreeRegs() const {
-    return reg_budget_ - live_count_ - static_cast<int>(live_pairs_.size());
+    return reg_budget_ - live_count_ - static_cast<int>(live_pairs_.size()) -
+           live_acc_count_;
   }
 
   bool IsFireable(int pid) const {
@@ -729,15 +790,22 @@ private:
     return count;
   }
 
+  /*! \brief Whether the path's output accumulator chain is already live. */
+  int OutputDirty(int pid) const {
+    int output = region_.paths[pid].output_label;
+    return AccEligible(output) && accs_[output].var.defined() ? 1 : 0;
+  }
+
   int ChooseFireablePath(const std::vector<int> &fireable) const {
     int best = -1;
-    std::array<int, 3> best_key{};
+    std::array<int, 4> best_key{};
     for (int pid : fireable) {
       int reuse = 0;
       for (int label : region_.paths[pid].input_labels) {
         reuse += remaining_uses_[label];
       }
-      std::array<int, 3> key{ReleaseNowCount(pid), reuse, -pid};
+      std::array<int, 4> key{ReleaseNowCount(pid), OutputDirty(pid), reuse,
+                             -pid};
       if (best < 0 || key > best_key) {
         best = pid;
         best_key = key;
@@ -943,7 +1011,7 @@ private:
     *out_label = best_label;
 
     *out_victim = -1;
-    if (FreeRegs() == 0 && live_count_ > 0) {
+    if (FreeRegs() <= 0 && live_count_ > 0) {
       std::set<int> avoid(labels.begin(), labels.end());
       *out_victim = ChooseSpillVictimAvoid(avoid);
     }
@@ -998,7 +1066,7 @@ private:
     }
     ReleasePairsTouchingLabel(label);
     live_[label] = false;
-    reg_of_[label] = Var();
+    reg_of_[label] = NullVar();
     --live_count_;
   }
 
@@ -1025,16 +1093,25 @@ private:
     if (live_[label]) {
       return;
     }
-    if (FreeRegs() == 0) {
-      // Pair temporaries are cheaper to drop than spilling operand labels.
+    // Accumulator chains may transiently push occupancy past the budget, so
+    // free registers until one is available: pair temporaries first (cheap
+    // to recompute), then operand labels (pure reloads), then accumulator
+    // chains (costs one extra store/atomic).
+    while (FreeRegs() <= 0 && !live_pairs_.empty()) {
       DropOnePairForPressure();
     }
-    if (FreeRegs() == 0) {
+    while (FreeRegs() <= 0) {
       if (victim < 0) {
         victim = ChooseSpillVictimAvoid({});
       }
-      ICHECK_GE(victim, 0);
-      ReleaseLabel(victim);
+      if (victim >= 0) {
+        ReleaseLabel(victim);
+        victim = -1;
+        continue;
+      }
+      if (!SpillOneAcc()) {
+        break; // nothing left to free; proceed over budget
+      }
     }
     const LabelInfo &info = region_.inputs.at(label);
     std::string name = "plr_" + info.name_hint + "_" + std::to_string(label);
@@ -1067,7 +1144,34 @@ private:
       }
     }
 
-    stmts_.push_back(EmitCompute(path, use_pair, pair_var));
+    PrimExpr product = BuildProduct(path, use_pair, pair_var);
+    if (AccEligible(path.output_label)) {
+      AccState &acc = accs_[path.output_label];
+      Var next("plr_acc_" + std::to_string(path.output_label) + "_" +
+                   std::to_string(acc.chain_length),
+               product.dtype());
+      if (acc.var.defined()) {
+        stmts_.push_back(Bind(next, Add(acc.var, product)));
+      } else {
+        // Cap concurrent chains at half the budget so operand labels always
+        // keep scheduling room; otherwise wide outputs (one chain per
+        // element) crowd out every label slot and the scheduler degrades
+        // into a spill/reload crawl.
+        if (live_acc_count_ >= std::max(1, reg_budget_ / 2)) {
+          SpillOneAcc();
+        }
+        stmts_.push_back(Bind(next, product));
+        ++live_acc_count_;
+      }
+      acc.var = next;
+      ++acc.chain_length;
+      acc.sink_pid = pid;
+      if (--acc.remaining == 0) {
+        FinalizeAcc(path.output_label);
+      }
+    } else {
+      stmts_.push_back(BuildSink(path, product));
+    }
     unscheduled_.erase(pid);
 
     if (path.pair_key.first >= 0) {
@@ -1085,6 +1189,40 @@ private:
         ReleaseLabel(label);
       }
     }
+  }
+
+  /*! \brief Emit the accumulated chain's sink and end its live range. */
+  void FinalizeAcc(int output_label) {
+    AccState &acc = accs_[output_label];
+    ICHECK(acc.var.defined());
+    stmts_.push_back(BuildSink(region_.paths[acc.sink_pid], acc.var));
+    acc.var = NullVar();
+    --live_acc_count_;
+  }
+
+  /*!
+   * \brief Spill the live accumulator with the fewest remaining
+   * contributions: its sink is emitted now and later contributions restart
+   * the chain (one extra store/atomic, never more than the unfused count).
+   */
+  bool SpillOneAcc() {
+    int best = -1;
+    std::pair<int, int> best_key{};
+    for (int output = 0; output < static_cast<int>(accs_.size()); ++output) {
+      if (!accs_[output].var.defined()) {
+        continue;
+      }
+      std::pair<int, int> key{accs_[output].remaining, output};
+      if (best < 0 || key < best_key) {
+        best = output;
+        best_key = key;
+      }
+    }
+    if (best < 0) {
+      return false;
+    }
+    FinalizeAcc(best);
+    return true;
   }
 
   /*! \brief The two pair operands in factor order for a given path. */
@@ -1149,23 +1287,24 @@ private:
     return result;
   }
 
-  Stmt EmitCompute(const ParsedPath &path, bool use_pair,
-                   const Var &pair_var) const {
-    PrimExpr new_product;
+  PrimExpr BuildProduct(const ParsedPath &path, bool use_pair,
+                        const Var &pair_var) const {
     if (use_pair) {
-      new_product = RebuildProductWithPair(path, pair_var);
-    } else {
-      // Substitution keeps the original multiplication tree shape, so the
-      // scheduled statement is bit-identical to the source path.
-      LabelLoadReplacer replacer(analyzer_, region_.inputs, reg_of_);
-      new_product = replacer(path.product);
+      return RebuildProductWithPair(path, pair_var);
     }
+    // Substitution keeps the original multiplication tree shape, so the
+    // scheduled statement is bit-identical to the source path.
+    LabelLoadReplacer replacer(analyzer_, region_.inputs, reg_of_);
+    return replacer(path.product);
+  }
 
+  /*! \brief Rebuild the path's sink around a scheduled contribution value. */
+  Stmt BuildSink(const ParsedPath &path, PrimExpr value) const {
     if (path.is_atomic) {
       const auto *eval = path.original.as<EvaluateNode>();
       Call call = Downcast<Call>(eval->value);
       Array<PrimExpr> args = call->args;
-      args.Set(1, new_product);
+      args.Set(1, std::move(value));
       call.CopyOnWrite()->args = std::move(args);
       return Evaluate(call);
     }
@@ -1173,8 +1312,8 @@ private:
     BufferStore store = Downcast<BufferStore>(path.original);
     const auto *add = store->value.as<AddNode>();
     PrimExpr new_value = add->b.same_as(path.product)
-                             ? Add(add->a, new_product)
-                             : Add(new_product, add->b);
+                             ? Add(add->a, std::move(value))
+                             : Add(std::move(value), add->b);
     store.CopyOnWrite()->value = std::move(new_value);
     return store;
   }
@@ -1193,6 +1332,10 @@ private:
   std::vector<int> reload_count_;
   int live_count_{0};
   std::set<int> unscheduled_;
+
+  /*! \brief Per-output accumulator states; empty when fusion is inactive. */
+  std::vector<AccState> accs_;
+  int live_acc_count_{0};
 
   std::map<PairKey, int> pair_remaining_;
   std::map<PairKey, int> pair_initial_;

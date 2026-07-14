@@ -416,6 +416,12 @@ def PathLocalityReorder():
     - path_fallback_after: no-progress threshold, 0 = 2*reg_budget (default 0)
     - allow_atomic_reorder: allow reordering updates to the same output
       element, relaxing float addition association (default False)
+    - enable_output_accumulation: with allow_atomic_reorder, accumulate all
+      contributions to one output element in registers and emit a single
+      final store/atomic per element (default True)
+    - enable_output_accumulation: with allow_atomic_reorder, fuse all
+      contributions to one output element into a register accumulator chain
+      and a single final store/atomic (default True)
 
     In the CUDA pipeline the pass only runs when the
     ``tl.enable_path_locality_reorder`` pass config is set to True.

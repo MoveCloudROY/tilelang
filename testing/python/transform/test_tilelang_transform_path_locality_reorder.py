@@ -399,6 +399,66 @@ def test_non_relaxed_atomic_fences_region():
     _assert_unchanged(before)
 
 
+def _count_atomic_calls(func):
+    calls = []
+    post_order_visit(
+        func.body,
+        lambda n: calls.append(n) if isinstance(n, tvm.tirx.Call) and n.op.name == "tl.atomic_add_elem_op" else None,
+    )
+    return len(calls)
+
+
+def test_output_accumulation_fuses_atomics():
+    @T.prim_func
+    def before(
+        w: T.Buffer((2,), "float32"),
+        x: T.Buffer((2,), "float32"),
+        y: T.Buffer((4,), "float32"),
+        out: T.Buffer((4,), "float32"),
+    ):
+        T.evaluate(
+            T.call_intrin(
+                "float32",
+                _ATOMIC_ADD_ELEM,
+                T.tvm_access_ptr(T.type_annotation("float32"), out.data, 0, 1, 3),
+                T.float32(2) * w[0] * x[0] * y[0],
+                0,
+            )
+        )
+        T.evaluate(
+            T.call_intrin(
+                "float32",
+                _ATOMIC_ADD_ELEM,
+                T.tvm_access_ptr(T.type_annotation("float32"), out.data, 0, 1, 3),
+                T.float32(3) * w[0] * x[0] * y[1],
+                0,
+            )
+        )
+        T.evaluate(
+            T.call_intrin(
+                "float32",
+                _ATOMIC_ADD_ELEM,
+                T.tvm_access_ptr(T.type_annotation("float32"), out.data, 0, 1, 3),
+                T.float32(4) * w[1] * x[1] * y[2],
+                0,
+            )
+        )
+
+    # Three contributions to out[0] fuse into one accumulator chain and a
+    # single final atomic.
+    after = _apply(before, {"allow_atomic_reorder": True})
+    assert _count_atomic_calls(after) == 1
+    acc_binds = [b for b in _collect(after.body, tvm.tirx.Bind) if isinstance(b.value, tvm.tirx.Add)]
+    assert len(acc_binds) == 2, "chain must add the 2nd and 3rd contributions"
+
+    # The escape hatch keeps one atomic per path.
+    after = _apply(before, {"allow_atomic_reorder": True, "enable_output_accumulation": False})
+    assert _count_atomic_calls(after) == 3
+
+    # Default policy still refuses to touch same-output updates entirely.
+    _assert_unchanged(before)
+
+
 def test_descriptor_tables_specialize_serial_loop():
     @T.prim_func
     def before(

@@ -197,6 +197,16 @@ class PassConfigKey(str, Enum):
     - allow_atomic_reorder: bool, default False. Allow reordering two updates
       to the same output element (relaxes floating-point addition
       association).
+    - enable_output_accumulation: bool, default True. Together with
+      allow_atomic_reorder, accumulate all contributions to one output
+      element in a scalar register chain and emit a single final
+      store/atomic per element (concurrent chains are capped at half the
+      register budget; overflowing chains store early and restart).
+    - enable_output_accumulation: bool, default True. Together with
+      allow_atomic_reorder, accumulate all contributions to one output
+      element in a scalar register chain and emit a single final
+      store/atomic per element instead of one per path (the FastEq
+      resident-accumulator policy).
 
     Usage:
         with tilelang.transform.PassContext(config={
