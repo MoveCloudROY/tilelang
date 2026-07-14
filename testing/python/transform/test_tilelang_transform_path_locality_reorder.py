@@ -399,6 +399,48 @@ def test_non_relaxed_atomic_fences_region():
     _assert_unchanged(before)
 
 
+def test_descriptor_tables_specialize_serial_loop():
+    @T.prim_func
+    def before(
+        x: T.Buffer((8,), "float32"),
+        idx: T.Buffer((4,), "int32"),
+        coeff: T.Buffer((4,), "float32"),
+        out: T.Buffer((4,), "float32"),
+    ):
+        for t in T.serial(4):
+            out[t] = out[t] + coeff[t] * x[idx[t]] * x[idx[t] + 1]
+
+    annotated = tilelang.transform.annotate_path_descriptors(before, {"idx": [0, 1, 1, 2], "coeff": [0.5, 0.25, 0.125, 2.0]})
+    mod = tvm.IRModule.from_expr(annotated.with_attr("global_symbol", "main"))
+    with tvm.transform.PassContext(config={"tl.PathLocalityReorder": {"enable_pair_cse": False}}):
+        after = tilelang.transform.PathLocalityReorder()(mod)["main"]
+
+    assert not _collect(after.body, tvm.tirx.For), "annotated path loop must specialize and unroll"
+    counts = _label_bind_counts(after)
+    # idx = [0,1,1,2] makes paths x[0]*x[1], x[1]*x[2], x[1]*x[2], x[2]*x[3].
+    for i in range(4):
+        assert counts[("x", (i,))] == 1, counts
+    for store in _collect(after.body, tvm.tirx.BufferStore):
+        loads = [ld for ld in _collect(store.value, tvm.tirx.BufferLoad) if ld.buffer.name in ("idx", "coeff")]
+        assert not loads, "descriptor loads must fold into constants"
+
+
+def test_serial_loop_without_descriptor_tables_kept():
+    @T.prim_func
+    def before(
+        x: T.Buffer((8,), "float32"),
+        idx: T.Buffer((4,), "int32"),
+        coeff: T.Buffer((4,), "float32"),
+        out: T.Buffer((4,), "float32"),
+    ):
+        for t in T.serial(4):
+            out[t] = out[t] + coeff[t] * x[idx[t]] * x[idx[t] + 1]
+
+    # Without the descriptor attr the labels stay runtime loads with no
+    # sharing, so the loop is preserved.
+    _assert_unchanged(before)
+
+
 def test_loop_annotation_fences_body_regions():
     @T.prim_func
     def before(

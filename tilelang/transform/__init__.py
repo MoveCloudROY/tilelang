@@ -426,3 +426,55 @@ def PathLocalityReorder():
         The result pass
     """
     return _ffi_api.PathLocalityReorder()  # type: ignore
+
+
+def annotate_path_descriptors(func, tables):
+    """Attach compile-time path-descriptor tables for PathLocalityReorder.
+
+    Marks descriptor tensor parameters of a runtime-descriptor path kernel
+    (e.g. ``i_list``/``j_list``/``k_list``/``v_list``/``coeff_list`` of a
+    uniform1d kernel with ``for t in T.serial(P)``) as having known contents.
+    When PathLocalityReorder unrolls the path loop, loads of these buffers at
+    constant indices fold into the given values, so the loop specializes into
+    the compile-time path form the pass can schedule.
+
+    The kernel signature is unchanged: the caller must still pass the
+    descriptor tensors at runtime, and their contents must match ``tables``
+    exactly (they become dead arguments in the specialized kernel).
+
+    Parameters
+    ----------
+    func : tvm.tirx.PrimFunc
+        The kernel whose descriptor parameters should be specialized.
+    tables : dict[str, Sequence[int | float]]
+        Maps a descriptor tensor parameter name to its compile-time values.
+        Values are converted to the parameter's dtype.
+
+    Returns
+    -------
+    func : tvm.tirx.PrimFunc
+        The function with the ``tl.path_locality_descriptors`` attr attached.
+    """
+    from tvm import tirx
+
+    buffers = {}
+    for param in func.params:
+        buffer = func.buffer_map.get(param)
+        if buffer is not None:
+            buffers[buffer.name] = buffer
+
+    attr_tables = {}
+    for name, values in tables.items():
+        buffer = buffers.get(name)
+        if buffer is None:
+            raise KeyError(f"annotate_path_descriptors: no tensor parameter named {name!r}; available: {sorted(buffers)}")
+        if hasattr(values, "tolist"):
+            values = values.tolist()
+        dtype = buffer.dtype
+        if dtype.startswith(("int", "uint")):
+            imms = [tirx.IntImm(dtype, int(v)) for v in values]
+        else:
+            imms = [tirx.FloatImm(dtype, float(v)) for v in values]
+        attr_tables[buffer.data] = imms
+
+    return func.with_attr("tl.path_locality_descriptors", attr_tables)

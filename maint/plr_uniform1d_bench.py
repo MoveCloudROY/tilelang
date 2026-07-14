@@ -297,6 +297,39 @@ def main():
             flush=True,
         )
 
+        # The same serial kernel with descriptor tables annotated: the pass
+        # folds the descriptor loads and schedules the specialized paths, so
+        # the user writes only the loop form.
+        annotated = tilelang.transform.annotate_path_descriptors(
+            sfunc,
+            {
+                "i_list": [p[0] for p in paths],
+                "j_list": [p[1] for p in paths],
+                "k_list": [p[2] for p in paths],
+                "v_list": [p[3] for p in paths],
+                "coeff_list": [p[4] for p in paths],
+            },
+        )
+        kernel = compile_kernel(annotated, enable=True, relaxed=True)
+        source = kernel.get_kernel_source()
+        out = torch.zeros(args.nodes, dim, args.lanes, device=dev)
+        kernel(w, x_all, y, out, src, dst, b_list, i_l, j_l, k_l, v_l, c_l)
+        max_rel = ((out.double() - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
+        torch.testing.assert_close(out.double(), ref, rtol=1e-3, atol=1e-3)
+        out.zero_()
+        ms = bench(
+            functools.partial(kernel, w, x_all, y, out, src, dst, b_list, i_l, j_l, k_l, v_l, c_l),
+            args.iters,
+            args.warmup,
+        )
+        stats = ptxas_stats(source, args.arch)
+        print(
+            f"  serial +descriptors   rewritten={str('plr_' in source):<5} lat={ms * 1e3:9.1f} us "
+            f"({base_ms / ms:5.3f}x vs const off) regs={stats['regs']:<3} "
+            f"spill={stats['spills'][0]}/{stats['spills'][1]} max_rel_err={max_rel:.2e}",
+            flush=True,
+        )
+
 
 if __name__ == "__main__":
     main()

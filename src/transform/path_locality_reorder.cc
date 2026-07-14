@@ -65,6 +65,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -82,6 +83,23 @@ constexpr const char *kPathLocalityReorderAnnotation =
 /*! \brief Boolean pass-context key that gates pipeline wiring. */
 constexpr const char *kEnablePathLocalityReorder =
     "tl.enable_path_locality_reorder";
+
+/*!
+ * \brief PrimFunc attr carrying compile-time path-descriptor tables.
+ *
+ * Maps a descriptor buffer's data var to the array of values the caller
+ * will pass at runtime (see tilelang.transform.annotate_path_descriptors).
+ * Loads of these buffers at constant indices fold into the table entries,
+ * so runtime-descriptor path loops such as
+ *
+ *   for t in T.serial(P):
+ *       T.atomic_add(out[dst, v_list[t], lane],
+ *                    coeff_list[t] * w[b, i_list[t], lane] * ...)
+ *
+ * specialize into the compile-time path form this pass schedules.
+ */
+constexpr const char *kPathLocalityDescriptorsAttr =
+    "tl.path_locality_descriptors";
 
 struct PathLocalityReorderConfigNode
     : public AttrsNodeReflAdapter<PathLocalityReorderConfigNode> {
@@ -272,6 +290,63 @@ void CollectReadDataVars(const PrimExpr &expr,
     }
   });
 }
+
+/*!
+ * \brief Fold loads of compile-time descriptor tables into constants.
+ *
+ * Only loads with a provably constant, in-bounds index fold; everything else
+ * is left untouched (and typically rejects the region later). The caller of
+ * the annotated kernel is responsible for passing tensors whose contents
+ * match the annotated tables.
+ */
+class DescriptorFolder : public StmtExprMutator {
+public:
+  DescriptorFolder(
+      const std::unordered_map<const VarNode *, Array<PrimExpr>> *tables,
+      arith::Analyzer *analyzer)
+      : tables_(tables), analyzer_(analyzer) {}
+
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    PrimExpr visited = StmtExprMutator::VisitExpr_(op);
+    const auto *load = visited.as<BufferLoadNode>();
+    if (load == nullptr || load->indices.size() != 1 ||
+        load->predicate.defined()) {
+      return visited;
+    }
+    auto it = tables_->find(load->buffer->data.get());
+    if (it == tables_->end()) {
+      return visited;
+    }
+    PrimExpr index = analyzer_->Simplify(load->indices[0]);
+    const auto *imm = index.as<IntImmNode>();
+    if (imm == nullptr || imm->value < 0 ||
+        imm->value >= static_cast<int64_t>(it->second.size())) {
+      return visited;
+    }
+    PrimExpr value = it->second[imm->value];
+    DataType dtype = load->buffer->dtype;
+    if (value.dtype() != dtype) {
+      if (const auto *int_value = value.as<IntImmNode>()) {
+        value = dtype.is_float()
+                    ? PrimExpr(FloatImm(dtype,
+                                        static_cast<double>(int_value->value)))
+                    : PrimExpr(IntImm(dtype, int_value->value));
+      } else if (const auto *float_value = value.as<FloatImmNode>()) {
+        if (!dtype.is_float() && !dtype.is_bfloat16()) {
+          return visited;
+        }
+        value = FloatImm(dtype, float_value->value);
+      } else {
+        return visited;
+      }
+    }
+    return value;
+  }
+
+private:
+  const std::unordered_map<const VarNode *, Array<PrimExpr>> *tables_;
+  arith::Analyzer *analyzer_;
+};
 
 /*! \brief Whether the fence annotation disables the pass for a scope. */
 bool PassFencedByAnnotation(const Map<String, Any> &annotations) {
@@ -1349,12 +1424,25 @@ public:
                           const PathLocalityReorderConfigNode *cfg,
                           arith::Analyzer *analyzer) {
     PathLocalityRewriter rewriter(cfg, analyzer);
+    if (auto tables = func->GetAttr<Map<Var, Array<PrimExpr>>>(
+            kPathLocalityDescriptorsAttr)) {
+      for (const auto &kv : tables.value()) {
+        rewriter.descriptor_tables_[kv.first.get()] = kv.second;
+      }
+    }
     auto *node = func.CopyOnWrite();
     node->body = rewriter(std::move(node->body));
     return func;
   }
 
 private:
+  /*! \brief Fold annotated descriptor loads; identity without tables. */
+  Stmt FoldDescriptors(Stmt stmt) {
+    if (descriptor_tables_.empty()) {
+      return stmt;
+    }
+    return DescriptorFolder(&descriptor_tables_, analyzer_)(std::move(stmt));
+  }
   Stmt VisitStmt_(const SeqStmtNode *op) final {
     Stmt visited = StmtExprMutator::VisitStmt_(op);
     const auto *seq = visited.as<SeqStmtNode>();
@@ -1426,7 +1514,8 @@ private:
         ++end;
         continue;
       }
-      Stmt resolved = pending.empty() ? stmt : Substitute(stmt, pending);
+      Stmt resolved =
+          FoldDescriptors(pending.empty() ? stmt : Substitute(stmt, pending));
       ParsedPath path;
       if (!parser.Parse(resolved, &path)) {
         break;
@@ -1527,7 +1616,7 @@ private:
                loop->min + make_const(loop->loop_var.dtype(), iter));
       for (const Stmt &tmpl : sink_templates) {
         ParsedPath path;
-        if (!parser.Parse(Substitute(tmpl, vmap), &path)) {
+        if (!parser.Parse(FoldDescriptors(Substitute(tmpl, vmap)), &path)) {
           return Stmt();
         }
         region.paths.push_back(std::move(path));
@@ -1548,6 +1637,7 @@ private:
 
   const PathLocalityReorderConfigNode *cfg_;
   arith::Analyzer *analyzer_;
+  std::unordered_map<const VarNode *, Array<PrimExpr>> descriptor_tables_;
 };
 
 } // namespace
