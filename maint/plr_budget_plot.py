@@ -34,9 +34,12 @@ def main():
     parser.add_argument("--csv", required=True)
     parser.add_argument("--out", default="plr_budget_sweep.png")
     parser.add_argument("--title", default="uniform1d on H100: PathLocalityReorder reg_budget sweep")
+    parser.add_argument("--max-budget", type=int, default=None, help="Drop data points with reg_budget above this value")
     args = parser.parse_args()
 
     data = load(args.csv)
+    if args.max_budget is not None:
+        data = {lmax: [r for r in rows if int(r["reg_budget"]) <= args.max_budget] for lmax, rows in data.items()}
     lmaxes = list(data)
     colors = {1: "tab:blue", 2: "tab:orange", 3: "tab:green"}
 
@@ -95,7 +98,11 @@ def main():
     ax.set_ylabel("speedup vs pass off")
     ax.set_title("Speedup vs reg_budget")
     ax.grid(alpha=0.3)
-    ax.legend(fontsize=8, ncol=2)
+    # Curves are flat lines spanning the full width, so reserve headroom
+    # above the highest curve and pin the legend there.
+    top = max(float(r["speedup_relaxed"]) for rows in data.values() for r in rows)
+    ax.set_ylim(0, top * 1.38)
+    ax.legend(fontsize=8, ncol=3, loc="upper center", framealpha=0.95)
 
     # Row 2 right: atomic count vs budget (relaxed).
     ax = fig.add_subplot(grid[1, len(lmaxes) - 1])
