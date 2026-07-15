@@ -299,6 +299,65 @@ def test_scalar_binds_are_inlined_and_consumed():
     assert len(stores) == 2
 
 
+def test_repeated_address_loads_hoisted_once():
+    @T.prim_func
+    def before(
+        w: T.Buffer((2,), "float32"),
+        x: T.Buffer((2,), "float32"),
+        base: T.Buffer((2,), "int32"),
+        out: T.Buffer((64,), "float32"),
+    ):
+        out[base[0] * 4] = out[base[0] * 4] + T.float32(2) * w[0] * x[0]
+        out[base[0] * 4 + 1] = out[base[0] * 4 + 1] + T.float32(3) * w[0] * x[1]
+        out[base[0] * 4 + 2] = out[base[0] * 4 + 2] + T.float32(4) * w[1] * x[0]
+
+    after = _apply(before, {"enable_pair_cse": False})
+    base_loads = [ld for ld in _collect(after.body, tvm.tirx.BufferLoad) if ld.buffer.name == "base"]
+    assert len(base_loads) == 1, "repeated base[0] address load must be hoisted into one register"
+    int_binds = [
+        b for b in _collect(after.body, tvm.tirx.Bind) if isinstance(b.value, tvm.tirx.BufferLoad) and b.value.buffer.name == "base"
+    ]
+    assert len(int_binds) == 1
+
+
+def test_distinct_index_buffers_not_merged_as_outputs():
+    @T.prim_func
+    def before(
+        w: T.Buffer((2,), "float32"),
+        x: T.Buffer((2,), "float32"),
+        idx1: T.Buffer((1,), "int32"),
+        idx2: T.Buffer((1,), "int32"),
+        out: T.Buffer((64,), "float32"),
+    ):
+        out[idx1[0] * 2] = out[idx1[0] * 2] + T.float32(2) * w[0] * x[0]
+        out[idx2[0] * 2] = out[idx2[0] * 2] + T.float32(3) * w[0] * x[1]
+
+    # idx1[0]*2 and idx2[0]*2 come from DIFFERENT tensors: they can neither
+    # be proven disjoint nor treated as the same element, even when
+    # reordering same-element updates is allowed.
+    _assert_unchanged(before)
+    _assert_unchanged(before, {"allow_atomic_reorder": True})
+
+
+def test_distinct_index_buffers_not_merged_as_labels():
+    @T.prim_func
+    def before(
+        w: T.Buffer((8,), "float32"),
+        y: T.Buffer((2,), "float32"),
+        idx1: T.Buffer((1,), "int32"),
+        idx2: T.Buffer((1,), "int32"),
+        out: T.Buffer((4,), "float32"),
+    ):
+        out[0] = out[0] + T.float32(2) * w[idx1[0]] * y[0]
+        out[1] = out[1] + T.float32(3) * w[idx2[0]] * y[0]
+
+    after = _apply(before, {"enable_pair_cse": False})
+    w_binds = [b for b in _collect(after.body, tvm.tirx.Bind) if isinstance(b.value, tvm.tirx.BufferLoad) and b.value.buffer.name == "w"]
+    # w[idx1[0]] and w[idx2[0]] are different elements and must stay two
+    # separate label loads.
+    assert len(w_binds) == 2, after
+
+
 def test_peeled_bind_used_after_region_is_kept():
     @T.prim_func
     def before(

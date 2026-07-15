@@ -52,7 +52,6 @@
 
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
-#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
@@ -229,7 +228,10 @@ public:
 
   /*! \brief Find an existing label without inserting; returns -1 if absent. */
   int Find(const ObjectRef &base, const Array<PrimExpr> &indices) const {
-    StructuralEqual eq;
+    // ExprDeepEqual, not StructuralEqual: the latter maps free vars and
+    // buffer definitions, so loads from DIFFERENT buffers with the same
+    // shape compare equal and distinct labels would merge.
+    ExprDeepEqual eq;
     for (size_t i = 0; i < labels_.size(); ++i) {
       const LabelInfo &info = labels_[i];
       if (!info.base.same_as(base) || info.indices.size() != indices.size()) {
@@ -451,7 +453,7 @@ private:
           load->indices.size() != store_indices.size()) {
         return false;
       }
-      StructuralEqual eq;
+      ExprDeepEqual eq;
       Array<PrimExpr> load_indices = NormalizeIndices(load->indices);
       for (size_t d = 0; d < load_indices.size(); ++d) {
         if (!eq(load_indices[d], store_indices[d])) {
@@ -1345,6 +1347,164 @@ private:
   Array<Stmt> stmts_;
 };
 
+/*! \brief Replace structural occurrences of one expression with a var. */
+class ExprOccurrenceReplacer : public StmtExprMutator {
+public:
+  ExprOccurrenceReplacer(PrimExpr target, Var replacement)
+      : target_(std::move(target)), replacement_(std::move(replacement)) {}
+
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    if (ExprDeepEqual()(GetRef<PrimExpr>(op), target_)) {
+      return replacement_;
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+private:
+  PrimExpr target_;
+  Var replacement_;
+};
+
+/*!
+ * \brief Hoist repeated scalar integer loads of a scheduled region into
+ * region-top Binds, so identical address/descriptor accesses stay in
+ * registers.
+ *
+ * Operand (floating) loads are already deduplicated as scheduled labels;
+ * what remains are integer loads inside index expressions and atomic
+ * pointer offsets (e.g. b_list[e], src_idx[b], dst_idx[b]). Upstream
+ * let-inlining copies these into every use before this pass runs, and local
+ * unrolling then replicates them once per path. Any integer load that
+ * occurs structurally at least twice is loaded once into a fresh scalar.
+ * Hoisting to the region top is safe for the same reason label loads are:
+ * a validated region writes only its provably-disjoint outputs, which alias
+ * none of the buffers read anywhere in the region.
+ *
+ * Runs innermost-first to a fixpoint so nested indirection such as
+ * src_idx[b_list[e]] collapses into chained scalars.
+ */
+class RepeatedIntLoadHoister {
+public:
+  static Array<Stmt> Hoist(Array<Stmt> stmts) {
+    Array<Stmt> defs;
+    int ordinal = 0;
+    for (int round = 0; round < kMaxRounds; ++round) {
+      std::vector<PrimExpr> repeated = RepeatedLoads(stmts, defs);
+      if (repeated.empty()) {
+        break;
+      }
+      for (const PrimExpr &load : Minimal(repeated)) {
+        Var reg("plr_addr_" + std::to_string(ordinal++), load.dtype());
+        ExprOccurrenceReplacer replacer(load, reg);
+        for (size_t i = 0; i < stmts.size(); ++i) {
+          stmts.Set(i, replacer(stmts[i]));
+        }
+        for (size_t i = 0; i < defs.size(); ++i) {
+          defs.Set(i, replacer(defs[i]));
+        }
+        defs.push_back(Bind(reg, load));
+      }
+    }
+    if (defs.empty()) {
+      return stmts;
+    }
+    Array<Stmt> result;
+    for (const Stmt &stmt : defs) {
+      result.push_back(stmt);
+    }
+    for (const Stmt &stmt : stmts) {
+      result.push_back(stmt);
+    }
+    return result;
+  }
+
+private:
+  static constexpr int kMaxRounds = 8;
+
+  static bool IsHoistable(const BufferLoadNode *load) {
+    DataType dtype = load->dtype;
+    if (dtype.lanes() != 1 || !(dtype.is_int() || dtype.is_uint())) {
+      return false;
+    }
+    if (load->predicate.defined()) {
+      return false;
+    }
+    for (const PrimExpr &index : load->indices) {
+      if (!IsPureExpr(index)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /*! \brief Structurally distinct hoistable loads occurring >= 2 times. */
+  static std::vector<PrimExpr> RepeatedLoads(const Array<Stmt> &stmts,
+                                             const Array<Stmt> &defs) {
+    std::vector<PrimExpr> uniq;
+    std::vector<int> count;
+    ExprDeepEqual eq;
+    auto visit = [&](const ObjectRef &obj) {
+      const auto *load = obj.as<BufferLoadNode>();
+      if (load == nullptr || !IsHoistable(load)) {
+        return;
+      }
+      PrimExpr expr = GetRef<PrimExpr>(load);
+      for (size_t i = 0; i < uniq.size(); ++i) {
+        if (eq(uniq[i], expr)) {
+          ++count[i];
+          return;
+        }
+      }
+      uniq.push_back(expr);
+      count.push_back(1);
+    };
+    for (const Stmt &stmt : stmts) {
+      PostOrderVisit(stmt, visit);
+    }
+    // Loads inside existing hoist defs count as uses too, so a load that
+    // still occurs elsewhere keeps collapsing, while a fully-hoisted one
+    // (single def occurrence) does not re-trigger.
+    for (const Stmt &stmt : defs) {
+      PostOrderVisit(stmt, visit);
+    }
+    std::vector<PrimExpr> repeated;
+    for (size_t i = 0; i < uniq.size(); ++i) {
+      if (count[i] >= 2) {
+        repeated.push_back(uniq[i]);
+      }
+    }
+    return repeated;
+  }
+
+  /*! \brief Keep only loads that contain no other repeated load. */
+  static std::vector<PrimExpr> Minimal(const std::vector<PrimExpr> &loads) {
+    ExprDeepEqual eq;
+    std::vector<PrimExpr> minimal;
+    for (const PrimExpr &candidate : loads) {
+      bool contains_other = false;
+      PostOrderVisit(candidate, [&](const ObjectRef &obj) {
+        if (contains_other || !obj.as<BufferLoadNode>()) {
+          return;
+        }
+        PrimExpr sub = Downcast<PrimExpr>(obj);
+        if (sub.same_as(candidate)) {
+          return;
+        }
+        for (const PrimExpr &other : loads) {
+          if (!other.same_as(candidate) && eq(sub, other)) {
+            contains_other = true;
+            return;
+          }
+        }
+      });
+      if (!contains_other) {
+        minimal.push_back(candidate);
+      }
+    }
+    return minimal;
+  }
+};
+
 /*! \brief The data var written by an output label. */
 const VarNode *OutputDataVar(const LabelInfo &info) {
   if (const auto *buffer = info.base.as<BufferNode>()) {
@@ -1391,9 +1551,9 @@ void CompareIndexDim(const PrimExpr &a, const PrimExpr &b,
                      bool *dim_distinct) {
   IndexParts pa = DecomposeIndex(a);
   IndexParts pb = DecomposeIndex(b);
-  bool sym_equal = (!pa.sym.defined() && !pb.sym.defined()) ||
-                   (pa.sym.defined() && pb.sym.defined() &&
-                    StructuralEqual()(pa.sym, pb.sym));
+  bool sym_equal =
+      (!pa.sym.defined() && !pb.sym.defined()) ||
+      (pa.sym.defined() && pb.sym.defined() && ExprDeepEqual()(pa.sym, pb.sym));
   if (sym_equal) {
     *dim_equal = pa.offset == pb.offset;
     *dim_distinct = pa.offset != pb.offset;
@@ -1677,6 +1837,7 @@ private:
     if (!scheduler.Schedule(&scheduled)) {
       return false;
     }
+    scheduled = RepeatedIntLoadHoister::Hoist(std::move(scheduled));
 
     // Peeled binds whose vars are still used after the run must be kept;
     // their values are pure and fully resolved, so hoisting them to the top
@@ -1775,7 +1936,8 @@ private:
     if (!scheduler.Schedule(&scheduled)) {
       return Stmt();
     }
-    return SeqStmt::Flatten(scheduled);
+    return SeqStmt::Flatten(
+        RepeatedIntLoadHoister::Hoist(std::move(scheduled)));
   }
 
   const PathLocalityReorderConfigNode *cfg_;
