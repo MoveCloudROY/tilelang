@@ -131,8 +131,9 @@ struct PathLocalityReorderConfigNode
                 refl::DefaultValue(64))
         .def_ro("reg_budget", &PathLocalityReorderConfigNode::reg_budget,
                 "Virtual register budget for live operand labels and pair "
-                "temporaries. This is a scheduling budget, not the ptxas "
-                "register count.",
+                "temporaries; resident output accumulators are budgeted "
+                "separately (capped at reg_budget/2 concurrent chains). This "
+                "is a scheduling budget, not the ptxas register count.",
                 refl::DefaultValue(16))
         .def_ro("enable_pair_cse",
                 &PathLocalityReorderConfigNode::enable_pair_cse,
@@ -675,12 +676,11 @@ public:
       }
     }
 
-    // The budget must admit at least one full path (plus one accumulator
-    // slot when fusion is active); clamp instead of failing so
-    // misconfiguration degrades to a correct (if less shared) schedule.
-    int acc_slack = accs_.empty() ? 0 : 1;
-    reg_budget_ = std::max(
-        {cfg->reg_budget, static_cast<int>(max_path_labels) + acc_slack, 2});
+    // The budget must admit at least one full path; clamp instead of
+    // failing so misconfiguration degrades to a correct (if less shared)
+    // schedule.
+    reg_budget_ =
+        std::max({cfg->reg_budget, static_cast<int>(max_path_labels), 2});
     path_fallback_after_ = cfg->path_fallback_after > 0
                                ? cfg->path_fallback_after
                                : std::max(8, 2 * reg_budget_);
@@ -760,9 +760,12 @@ private:
     return !accs_.empty() && accs_[output_label].remaining > 0;
   }
 
+  // Accumulator chains are accounted separately (their own concurrency cap
+  // in Fire): counting them here starved operand labels of budget slots and
+  // caused spill/reload churn - e.g. at lmax=3/budget 32 the 16 resident
+  // chains left only 16 slots for 66 labels, reloading 20 addresses.
   int FreeRegs() const {
-    return reg_budget_ - live_count_ - static_cast<int>(live_pairs_.size()) -
-           live_acc_count_;
+    return reg_budget_ - live_count_ - static_cast<int>(live_pairs_.size());
   }
 
   bool IsFireable(int pid) const {
@@ -1111,9 +1114,10 @@ private:
         victim = -1;
         continue;
       }
-      if (!SpillOneAcc()) {
-        break; // nothing left to free; proceed over budget
-      }
+      // Accumulators live outside this budget, so nothing else can free a
+      // slot; this is unreachable in practice (no free slot implies a live
+      // label or pair exists).
+      break;
     }
     const LabelInfo &info = region_.inputs.at(label);
     std::string name = "plr_" + info.name_hint + "_" + std::to_string(label);
@@ -1155,10 +1159,11 @@ private:
       if (acc.var.defined()) {
         stmts_.push_back(Bind(next, Add(acc.var, product)));
       } else {
-        // Cap concurrent chains at half the budget so operand labels always
-        // keep scheduling room; otherwise wide outputs (one chain per
-        // element) crowd out every label slot and the scheduler degrades
-        // into a spill/reload crawl.
+        // Accumulator chains are budgeted separately from operand labels:
+        // labels use the full reg_budget while concurrent chains are capped
+        // at half of it, bounding total virtual residency at 1.5x the
+        // configured budget. A chain past the cap stores early and
+        // restarts.
         if (live_acc_count_ >= std::max(1, reg_budget_ / 2)) {
           SpillOneAcc();
         }
