@@ -78,17 +78,17 @@ def _import_kernel(source, tag):
     return module.main
 
 
-def _kernel_header(edges, nodes, dim, n_trios, lanes, warps, serial_paths):
+def _kernel_header(edges, nodes, dim, n_trios, lanes, warps, serial_paths, dtype="float32"):
     blocks = (edges + warps - 1) // warps
     lines = [
         "import tilelang.language as T",
         "",
         "@T.prim_func",
         "def main(",
-        f"    w: T.Tensor(({edges}, {dim}, {lanes}), 'float32'),",
-        f"    x_all: T.Tensor(({nodes}, {dim}, {lanes}), 'float32'),",
-        f"    y: T.Tensor(({edges}, {n_trios}), 'float32'),",
-        f"    out: T.Tensor(({nodes}, {dim}, {lanes}), 'float32'),",
+        f"    w: T.Tensor(({edges}, {dim}, {lanes}), '{dtype}'),",
+        f"    x_all: T.Tensor(({nodes}, {dim}, {lanes}), '{dtype}'),",
+        f"    y: T.Tensor(({edges}, {n_trios}), '{dtype}'),",
+        f"    out: T.Tensor(({nodes}, {dim}, {lanes}), '{dtype}'),",
         f"    src_idx: T.Tensor(({edges},), 'int32'),",
         f"    dst_idx: T.Tensor(({edges},), 'int32'),",
         f"    b_list: T.Tensor(({edges},), 'int32'),",
@@ -100,7 +100,7 @@ def _kernel_header(edges, nodes, dim, n_trios, lanes, warps, serial_paths):
             f"    j_list: T.Tensor(({num_paths},), 'int32'),",
             f"    k_list: T.Tensor(({num_paths},), 'int32'),",
             f"    v_list: T.Tensor(({num_paths},), 'int32'),",
-            f"    coeff_list: T.Tensor(({num_paths},), 'float32'),",
+            f"    coeff_list: T.Tensor(({num_paths},), '{dtype}'),",
         ]
     lines += [
         "):",
@@ -117,17 +117,17 @@ def _kernel_header(edges, nodes, dim, n_trios, lanes, warps, serial_paths):
     return lines
 
 
-def build_const_kernel(paths, edges, nodes, dim, n_trios, lanes, warps, tag):
-    lines = _kernel_header(edges, nodes, dim, n_trios, lanes, warps, None)
+def build_const_kernel(paths, edges, nodes, dim, n_trios, lanes, warps, tag, dtype="float32"):
+    lines = _kernel_header(edges, nodes, dim, n_trios, lanes, warps, None, dtype)
     for i, j, k, v, c in paths:
         lines.append(
-            f"            T.atomic_add(out[dst, {v}, lane], T.float32({c!r}) * w[b, {i}, lane] * x_all[src, {j}, lane] * y[b, {k}])"
+            f"            T.atomic_add(out[dst, {v}, lane], T.{dtype}({c!r}) * w[b, {i}, lane] * x_all[src, {j}, lane] * y[b, {k}])"
         )
     return _import_kernel("\n".join(lines) + "\n", tag)
 
 
-def build_serial_kernel(num_paths, edges, nodes, dim, n_trios, lanes, warps, tag):
-    lines = _kernel_header(edges, nodes, dim, n_trios, lanes, warps, num_paths)
+def build_serial_kernel(num_paths, edges, nodes, dim, n_trios, lanes, warps, tag, dtype="float32"):
+    lines = _kernel_header(edges, nodes, dim, n_trios, lanes, warps, num_paths, dtype)
     lines += [
         f"            for t in T.serial({num_paths}):",
         "                i = i_list[t]",
